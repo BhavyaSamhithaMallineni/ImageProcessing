@@ -1,0 +1,320 @@
+#####################################################
+# EE569 Homework Assignment #6
+# Date  : May 1st, 2024
+# Name  : Bhavya Samhitha Mallineni
+# USCID : 6580252371
+# email : mallinen@usc.edu
+####################################################
+# Problem 2 a b and c MNIST : PixelHop++ and PixelHop
+# Implementation : Saab
+# Input Image File : MNIST and FashionMNIST
+# Open Source : Channelwise-Saab-Transform
+#################################################
+!git clone https://github.com/USC-MCL/Channelwise-Saab-Transform.git
+!pip install numpy scikit-image numba scikit-learn xgboost tensorflow
+!git clone https://github.com/USC-MCL/Channelwise-Saab-Transform.git
+import os
+os.chdir('Channelwise-Saab-Transform')
+!pip install pixelhop
+import numpy as np
+from tensorflow.keras.datasets import mnist,fashion_mnist
+from skimage.util import view_as_windows
+from pixelhop import Pixelhop
+from skimage.measure import block_reduce
+from sklearn.metrics import accuracy_score
+import matplotlib.pyplot as plt
+import xgboost as xgb
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, accuracy_score
+import warnings, gc
+warnings.simplefilter(action='ignore', category=FutureWarning)
+import time
+
+np.random.seed(1)
+
+# Preprocess
+N_Train_Reduced = 10000    # 10000
+N_Train_Full = 60000     #60000
+N_Test = 10000            # 10000
+
+BS = 2000 
+
+def shuffle_data(X, y):
+    shuffle_idx = np.random.permutation(y.size)
+    X = X[shuffle_idx]
+    y = y[shuffle_idx]
+    return X, y
+def select_balanced_subset(images, labels, use_num_images):
+    '''
+    select equal number of images from each classes
+    '''
+    num_total, H, W, C = images.shape
+    num_class = np.unique(labels).size
+    num_per_class = int(use_num_images / num_class)
+
+    # Shuffle
+    images, labels = shuffle_data(images, labels)
+
+    selected_images = np.zeros((use_num_images, H, W, C))
+    selected_labels = np.zeros(use_num_images)
+
+    for i in range(num_class):
+        selected_images[i * num_per_class:(i + 1) * num_per_class] = images[labels == i][:num_per_class]
+        selected_labels[i * num_per_class:(i + 1) * num_per_class] = np.ones((num_per_class)) * i
+
+    # Shuffle again
+    selected_images, selected_labels = shuffle_data(selected_images, selected_labels)
+
+    return selected_images, selected_labels
+
+def Shrink(X, shrinkArg):
+    
+    pool = shrinkArg['pool']
+    poolh, poolw = 2, 2
+    if pool:
+        X = block_reduce(X, block_size=(1, poolh, poolw, 1), func=np.max)
+
+    
+    win = shrinkArg['win']
+    stride = shrinkArg['stride']
+    pad = shrinkArg['pad']
+
+    if pad > 0:
+        X = np.pad(X, ((0,0), (pad,pad), (pad,pad), (0,0)), mode='reflect')
+
+    X = view_as_windows(X, (1, win, win, X.shape[-1]), step=(1, stride, stride, X.shape[-1]))
+    shrink_arg =X.reshape(X.shape[0], X.shape[1], X.shape[2], -1)
+
+    return shrink_arg
+
+def get_feat(X, num_layers=3):
+    output = p2.transform_singleHop(X,layer=0)
+    if num_layers>1:
+        for i in range(num_layers-1):
+            output = p2.transform_singleHop(output, layer=i+1)
+    return output
+  def Concat(X, concatArg):
+    return X
+warnings.filterwarnings("ignore")
+start_time = time.time()
+(x_train, y_train), (x_test, y_test) = mnist.load_data()
+x_train, x_test = x_train.astype('float32')[..., np.newaxis] / 255.0, x_test.astype('float32')[..., np.newaxis] / 255.0
+y_train, y_test = y_train.astype('int'), y_test.astype('int')
+x_train_reduced, y_train_reduced = select_balanced_subset(x_train, y_train, N_Train_Reduced)
+
+print('Running Module 1...')
+SaabArgs = [{'num_AC_kernels': -1, 'needBias': False, 'cw': False}, {'num_AC_kernels': -1, 'needBias': True, 'cw': True}, {'num_AC_kernels': -1, 'needBias': True, 'cw': True}]
+shrinkArgs = [{'func': Shrink, 'win': 5, 'stride': 1, 'pad': 2, 'pool': False}, {'func': Shrink, 'win': 5, 'stride': 1, 'pad': 0, 'pool': True}, {'func': Shrink, 'win': 5, 'stride': 1, 'pad': 0, 'pool': True}]
+
+concatArg = {'func': Concat}
+  
+#module 1
+p2 = Pixelhop(depth=3, TH1=0.001, TH2=0.001, SaabArgs=SaabArgs, shrinkArgs=shrinkArgs, concatArg=concatArg)
+p2.fit(x_train_reduced)
+
+#Module 2
+train_hop3_feats = get_feat(x_train)
+test_hop3_feats = get_feat(x_test)
+STD = np.std(train_hop3_feats, axis=0, keepdims=True)
+train_hop3_feats /= STD
+test_hop3_feats /= STD
+
+train_hop3_reshaped = train_hop3_feats.reshape(train_hop3_feats.shape[0], -1)
+test_hop3_reshaped = test_hop3_feats.reshape(test_hop3_feats.shape[0], -1)
+
+# Module 3
+clf = xgb.XGBClassifier(n_jobs=-1, objective='multi:softprob', max_depth=6, n_estimators=100, min_child_weight=5, gamma=5, subsample=0.8, learning_rate=0.1, nthread=8, colsample_bytree=1.0)
+clf.fit(train_hop3_reshaped, y_train)
+
+pred_train = clf.predict(train_hop3_reshaped)
+pred_test = clf.predict(test_hop3_reshaped)
+train_accuracy = accuracy_score(y_train, pred_train)
+test_accuracy = accuracy_score(y_test, pred_test)
+
+end_time = time.time()
+training_time = end_time - start_time
+
+print("Train Accuracy:", train_accuracy)
+print("Test Accuracy:", test_accuracy)
+print("Training Time:", training_time, "seconds")
+
+feats_K1 = get_feat(x_train,num_layers=0)
+feats_K2 = get_feat(x_train,num_layers=2)
+feats_K3 = get_feat(x_train,num_layers=3)
+K1 = feats_K1.shape[-1]
+K2 = feats_K2.shape[-1]
+K3 = feats_K3.shape[-1]
+print("K1 Features:", K1)
+print("K2 Features:", K2)
+print("K3 Features:", K3)
+
+
+th1_values = [ 0.001,0.005, 0.01, 0.05, 0.1]
+test_accuracies = [ 96.63,96.28, 96.14, 93.12, 90.87]
+
+plt.figure(figsize=(10, 5))
+plt.plot(th1_values, test_accuracies, marker='o', linestyle='-', color='g')
+plt.title('TH1 vs. Test Accuracy')
+plt.xlabel('TH1 Values')
+plt.ylabel('Test Accuracy (%)')
+plt.grid(True)
+plt.show()
+
+### problem 2b
+
+def get_feat(X, p2, num_layers=3):
+    output = p2.transform_singleHop(X,layer=0)
+    if num_layers>1:
+        for i in range(num_layers-1):
+            output = p2.transform_singleHop(output, layer=i+1)
+    return output
+def reshape_feats(train_feats, test_feats):
+    N_train, _, _, X_train = train_feats.shape
+    N_test, _, _, X_test = test_feats.shape
+    train = np.reshape(train_feats, (N_train, X_train))
+    test = np.reshape(test_feats, (N_test, X_test))
+    
+    return train, test
+warnings.filterwarnings("ignore")
+(x_train, y_train), (x_test, y_test) = fashion_mnist.load_data()
+x_train, x_test = x_train.astype('float32')[..., np.newaxis] / 255.0, x_test.astype('float32')[..., np.newaxis] / 255.0
+y_train, y_test = y_train.astype('int'), y_test.astype('int')
+x_train_reduced, y_train_reduced = select_balanced_subset(x_train, y_train, N_Train_Reduced)
+
+#Module 1
+shrinkArgs = [{'func': Shrink, 'win': 5, 'stride': 1, 'pad': 2, 'pool': False}, {'func': Shrink, 'win': 5, 'stride': 1, 'pad': 0, 'pool': True}, {'func': Shrink, 'win': 5, 'stride': 1, 'pad': 0, 'pool': True}]
+SaabArgs_base = [{'num_AC_kernels':-1, 'needBias':False, 'cw':False},
+        {'num_AC_kernels':-1, 'needBias':True, 'cw':False},
+        {'num_AC_kernels':-1, 'needBias':True, 'cw':False}]
+SaabArgs_plus = [{'num_AC_kernels':-1, 'needBias':False, 'cw':False},
+        {'num_AC_kernels':-1, 'needBias':True, 'cw':True},
+        {'num_AC_kernels':-1, 'needBias':True, 'cw':True}]
+concatArg = {'func': Concat}
+print('Running Module 1...')
+
+p2_base = Pixelhop(depth=3, TH1=0.005, TH2=0.1,
+          SaabArgs=SaabArgs_base, shrinkArgs=shrinkArgs, concatArg=concatArg)
+p2_plus = Pixelhop(depth=3, TH1=0.005, TH2=0.1,
+          SaabArgs=SaabArgs_plus, shrinkArgs=shrinkArgs, concatArg=concatArg)
+
+start_time_plus = time.time()
+p2_plus.fit(x_train_reduced)
+start_time_base = time.time()
+p2_base.fit(x_train_reduced)
+
+
+#Module 2
+train_hop3_feats_plus = get_feat(x_train, p2_plus)
+test_hop3_feats_plus = get_feat(x_test, p2_plus)
+train_hop3_feats_base = get_feat(x_train, p2_base)
+test_hop3_feats_base = get_feat(x_test, p2_base)
+
+STD_plus = np.std(train_hop3_feats_plus, axis=0, keepdims=1)
+STD_base = np.std(train_hop3_feats_base, axis=0, keepdims=1)
+train_hop3_feats_plus = train_hop3_feats_plus/STD_plus
+test_hop3_feats_plus = test_hop3_feats_plus/STD_plus
+train_hop3_feats_base = train_hop3_feats_base/STD_base
+test_hop3_feats_base = test_hop3_feats_base/STD_base
+train_plus_reshaped, test_plus_reshaped = reshape_feats(train_hop3_feats_plus, test_hop3_feats_plus)
+train_base_reshaped, test_base_reshaped = reshape_feats(train_hop3_feats_base, test_hop3_feats_base)
+
+#Module 3
+clf_plus = xgb.XGBClassifier(n_jobs=-1,
+                objective='multi:softprob',
+                max_depth=6,n_estimators=100,
+                min_child_weight=5,gamma=5,
+                subsample=0.8,learning_rate=0.1,
+                nthread=8,colsample_bytree=1.0)
+
+clf_base = xgb.XGBClassifier(n_jobs=-1,
+                objective='multi:softprob',
+                max_depth=6,n_estimators=100,
+                min_child_weight=5,gamma=5,
+                subsample=0.8,learning_rate=0.1,
+                nthread=8,colsample_bytree=1.0)
+print('Fitting xgboost on PixelHop++...')
+clf_plus.fit(train_plus_reshaped, y_train)
+print('Done. \nFitting xgboost on PixelHop...')
+clf_base.fit(train_base_reshaped, y_train)
+print('Done.')
+end_time_plus = time.time()
+plus_training_time = end_time_plus - start_time_plus
+end_time_base = time.time()
+base_training_time = end_time_base - start_time_base
+
+print('Total Training Time for PixelHop++:', plus_training_time, 'seconds')
+print('Total Training Time for PixelHop:', base_training_time, 'seconds')
+
+train_preds_plus = clf_plus.predict(train_plus_reshaped)
+test_preds_plus = clf_plus.predict(test_plus_reshaped)
+train_accuracy_plus = accuracy_score(y_train, train_preds_plus)
+test_accuracy_plus = accuracy_score(y_test, test_preds_plus)
+
+train_preds_base = clf_base.predict(train_base_reshaped)
+test_preds_base = clf_base.predict(test_base_reshaped)
+train_accuracy_base = accuracy_score(y_train, train_preds_base)
+test_accuracy_base = accuracy_score(y_test, test_preds_base
+
+feats_K1_plus = get_feat(x_train, p2_plus, num_layers=1)
+feats_K2_plus = get_feat(x_train, p2_plus, num_layers=2)
+feats_K3_plus = get_feat(x_train, p2_plus, num_layers=3)
+K1_plus = feats_K1_plus.shape[-1]
+K2_plus = feats_K2_plus.shape[-1]
+K3_plus = feats_K3_plus.shape[-1]
+
+feats_K1_base = get_feat(x_train, p2_base, num_layers=1)
+feats_K2_base = get_feat(x_train, p2_base, num_layers=2)
+feats_K3_base = get_feat(x_train, p2_base, num_layers=3)
+K1_base = feats_K1_base.shape[-1]
+K2_base = feats_K2_base.shape[-1]
+K3_base = feats_K3_base.shape[-1]
+
+print("PixelHop++ Train Accuracy:", train_accuracy_plus)
+print("PixelHop++ Test Accuracy:", test_accuracy_plus)
+print("PixelHop++ K1 Features:", K1_plus)
+print("PixelHop++ K2 Features:", K2_plus)
+print("PixelHop++ K3 Features:", K3_plus)
+
+print("PixelHop Train Accuracy:", train_accuracy_base)
+print("PixelHop Test Accuracy:", test_accuracy_base)
+print("PixelHop K1 Features:", K1_base)
+print("PixelHop K2 Features:", K2_base)
+print("PixelHop K3 Features:", K3_base)                                    
+ 
+th2_values = [0.001, 0.01, 0.1]
+train_accuracies_ph_plus = [98.32, 86.87, 20.78]
+test_accuracies_ph_plus = [96.45, 83.51, 20.45]
+train_accuracies_ph = [98.47, 96.32, 44.45]
+test_accuracies_ph = [96.26, 94.44, 44.31]
+
+plt.figure(figsize=(12, 6))
+plt.plot(th2_values, train_accuracies_ph_plus, marker='o', linestyle='-', color='b', label='PixelHop++ Train Accuracy')
+plt.plot(th2_values, test_accuracies_ph_plus, marker='o', linestyle='--', color='b', label='PixelHop++ Test Accuracy')
+plt.plot(th2_values, train_accuracies_ph, marker='o', linestyle='-', color='g', label='PixelHop Train Accuracy')
+plt.plot(th2_values, test_accuracies_ph, marker='o', linestyle='--', color='g', label='PixelHop Test Accuracy')
+plt.title('Train and Test Accuracy vs TH2 for PixelHop and PixelHop++')
+plt.xlabel('TH2 Values')
+plt.ylabel('Accuracy (%)')
+plt.legend()
+plt.grid(True)
+
+#### Problem 2c
+ 
+cm = confusion_matrix(y_test, pred_test)
+print("Confusion Matrix:")
+print(cm)
+
+plt.figure(figsize=(10, 8))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Greens', xticklabels=np.unique(y_test), yticklabels=np.unique(y_test))
+plt.title('Confusion Matrix')
+plt.xlabel('Predicted Label')
+plt.ylabel('True Label')
+plt.show()
+
+class_accuracy = cm.diagonal() / cm.sum(axis=1)
+lowest_error_class = np.argmin(class_accuracy)
+highest_error_class = np.argmax(class_accuracy)
+
+print(f"Class with the lowest error rate: {lowest_error_class} (Error Rate: {1 - class_accuracy[lowest_error_class]:.2f})")
+print(f"Class with the highest error rate: {highest_error_class} (Error Rate: {1 - class_accuracy[highest_error_class]:.2f})")
+ 
